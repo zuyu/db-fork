@@ -462,6 +462,49 @@ class MatrixOneToolSuite(DBToolSuite):
         self._execute(f"INSERT IGNORE INTO {_qt(self._meta_db, BRANCHES_TABLE)} (name, db, gen) "
                       "VALUES (%s, %s, 0)", (MAIN_BRANCH, self.db_name))
 
+    def _rebase_attempt_store(self):
+        from .matrixone_rebase import RebaseAttemptStore
+        return RebaseAttemptStore(lambda: connect(None), self._meta_db)
+
+    def _prepare_native_rebase_attempt(self, ref: Ref, onto: Ref, on_conflict="fail"):
+        """Prepare durable intent only; no snapshot or publication is sent."""
+        if ref.commit or onto.commit:
+            raise self._unsupported("rebase", "native publication requires branch heads")
+        source, upstream = self._registry_row(ref.branch), self._registry_row(onto.branch)
+        if source is None or upstream is None or source[0] == upstream[0]:
+            raise ValueError("native Rebase requires two registered branch heads")
+        bases = self._base_rows(source[0], upstream[0])
+        relation = self._relation(source[0], upstream[0], bases)
+        if relation is None:
+            raise self._unsupported("rebase", "native publication requires a recorded common base")
+        row = relation[2]
+        child_base = (row["db"], row["snap"])
+        parent_base = (row["prev_db"], row["prev_snap"])
+        feature_base, upstream_base = ((child_base, parent_base) if relation[0] == source[0]
+                                       else (parent_base, child_base))
+        return self._rebase_attempt_store().prepare(
+            ref.branch, onto.branch, source_registration=source, upstream_registration=upstream,
+            feature_base=feature_base, upstream_base=upstream_base, base_sequence=row["seq"],
+            on_conflict=on_conflict)
+
+    def _request_native_rebase_snapshots(self, attempt_id: str):
+        """Disabled-path preparation only; never publishes or retries an attempt."""
+        return self._rebase_attempt_store().request_snapshots(attempt_id)
+
+    def _publish_native_rebase_attempt(self, attempt_id: str):
+        """Explicit candidate path only; the ordinary benchmark path stays off."""
+        result = self._rebase_attempt_store().publish(attempt_id)
+        self._current_db = None
+        return result
+
+    def list_rebase_attempts(self, branch: str, after=None, limit=100):
+        """MO-only bounded inspection; does not create or retry publications."""
+        return self._rebase_attempt_store().list_attempts(branch, after, limit)
+
+    def recover_rebase(self, attempt_id: str):
+        """Confirm an original attempt under locks; UNKNOWN retains resources."""
+        return self._rebase_attempt_store().recover(attempt_id)
+
     def _registry_row(self, branch: str):
         rows = self._execute(f"SELECT db, gen FROM {_qt(self._meta_db, BRANCHES_TABLE)} "
                              "WHERE name = %s", (branch,))
@@ -569,15 +612,8 @@ class MatrixOneToolSuite(DBToolSuite):
             "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
             "ORDER BY c.table_name, c.ordinal_position",
             (db, META_PREFIX.replace("_", r"\_") + "%")) or []
-        out: dict = {}
-        for table, col, ctype, key in rows:
-            if str(col).startswith("__mo_"):
-                continue
-            t = out.setdefault(str(table), {"cols": {}, "pk": []})
-            t["cols"][str(col)] = str(ctype).lower()
-            if str(key or "").upper() == "PRI":
-                t["pk"].append(str(col))
-        return out
+        from .matrixone_rebase import schema_fingerprint_rows
+        return schema_fingerprint_rows(rows)
 
     def _add_commit(self, db: str, kind: str, message: str, snap, snap_db: str,
                     prev_snap, prev_db, commit_id: str = None, take_snapshot: bool = False,
@@ -669,11 +705,19 @@ class MatrixOneToolSuite(DBToolSuite):
         that made one of the two databases a clone of the other, or None
         when neither descends from the other."""
         x_base, y_base = self._base_rows(x_db, y_db) if base_rows is None else base_rows
+        relevant = [x_db, y_db] + [row["prev_db"] for row in (x_base, y_base)
+                                   if row["kind"] in ("fork", "rebase")]
+        branches = {db: branch_of_db(self.db_name, db) for db in relevant}
+        from .matrixone_rebase import native_generation_attempt
+        native_names = [db for db in relevant if db.lower() != self.db_name.lower()
+                        and native_generation_attempt(db) is not None]
+        if native_names:
+            branches.update(self._rebase_attempt_store().generation_branches(*native_names))
         cands = []
         for child, parent, row in ((x_db, y_db, x_base), (y_db, x_db, y_base)):
             # prev_db names the parent's generation at fork/rebase time.
             if (row["kind"] in ("fork", "rebase")
-                    and branch_of_db(self.db_name, row["prev_db"]) == branch_of_db(self.db_name, parent)):
+                    and branches[row["prev_db"]] == branches[parent]):
                 cands.append((child, parent, row))
         if not cands:
             return None
